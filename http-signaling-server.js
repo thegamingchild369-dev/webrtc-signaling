@@ -13,7 +13,7 @@ app.get('/', (req, res) => {
   res.send("✅ HTTP signaling server is running");
 });
 
-// Room status (for debugging)
+// Room status (optional diagnostics)
 app.get('/status', (req, res) => {
   res.json({ rooms });
 });

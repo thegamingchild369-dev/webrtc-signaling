@@ -1,11 +1,25 @@
 {
-  "name": "webrtc-signaling",
+  "name": "webrtc-http-signaling",
   "version": "1.0.0",
-  "main": "signaling-server.js",
+  "description": "WebRTC signaling server using HTTP for SDP and ICE exchange",
+  "main": "http-signaling-server.js",
   "scripts": {
-    "start": "node signaling-server.js"
+    "start": "node http-signaling-server.js"
   },
   "dependencies": {
-    "ws": "^8.13.0"
-  }
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "http",
+    "express",
+    "video-chat"
+  ],
+  "author": "Joshua",
+  "license": "MIT"
 }

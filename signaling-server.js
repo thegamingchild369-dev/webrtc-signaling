@@ -1,48 +1,59 @@
-const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+const express = require('express');
+const cors = require('cors');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
 
 const rooms = {};
 
-wss.on('connection', socket => {
-  let roomId = null;
-  let clientId = Math.random().toString(36).substr(2, 9);
-
-  socket.on('message', msg => {
-    const data = JSON.parse(msg);
-
-    if (data.join) {
-      roomId = data.join;
-      rooms[roomId] = rooms[roomId] || {};
-      rooms[roomId][clientId] = socket;
-
-      // Notify new client of existing peers
-      Object.keys(rooms[roomId]).forEach(id => {
-        if (id !== clientId) {
-          socket.send(JSON.stringify({ type: "peer", id }));
-        }
-      });
-
-      // Notify existing peers of new client
-      Object.entries(rooms[roomId]).forEach(([id, peer]) => {
-        if (id !== clientId && peer.readyState === WebSocket.OPEN) {
-          peer.send(JSON.stringify({ type: "peer", id: clientId }));
-        }
-      });
-
-      return;
-    }
-
-    // Relay signaling messages
-    if (data.to && rooms[roomId]?.[data.to]) {
-      rooms[roomId][data.to].send(JSON.stringify({ ...data, from: clientId }));
-    }
-  });
-
-  socket.on('close', () => {
-    if (roomId && rooms[roomId]) {
-      delete rooms[roomId][clientId];
-    }
-  });
+// Health check
+app.get('/', (req, res) => {
+  res.send("✅ HTTP signaling server is running");
 });
 
-console.log("✅ Signaling server running");
+// Join a room
+app.post('/join', (req, res) => {
+  const { room, clientId } = req.body;
+  if (!room || !clientId) {
+    return res.status(400).json({ error: "Missing room or clientId" });
+  }
+
+  rooms[room] = rooms[room] || {};
+  rooms[room][clientId] = [];
+
+  const peers = Object.keys(rooms[room]).filter(id => id !== clientId);
+  console.log(`📥 ${clientId} joined room ${room}, peers: ${peers.length}`);
+  res.json({ peers });
+});
+
+// Send signaling data (SDP or ICE)
+app.post('/signal', (req, res) => {
+  const { room, to, from, data } = req.body;
+  if (!room || !to || !from || !data) {
+    return res.status(400).json({ error: "Missing signaling fields" });
+  }
+
+  if (rooms[room]?.[to]) {
+    rooms[room][to].push({ from, data });
+    console.log(`📡 Signal from ${from} to ${to} in room ${room}`);
+  }
+  res.sendStatus(200);
+});
+
+// Poll for incoming messages
+app.post('/poll', (req, res) => {
+  const { room, clientId } = req.body;
+  if (!room || !clientId) {
+    return res.status(400).json({ error: "Missing room or clientId" });
+  }
+
+  const messages = rooms[room]?.[clientId] || [];
+  rooms[room][clientId] = [];
+  res.json({ messages });
+});
+
+app.listen(port, () => {
+  console.log(`✅ HTTP signaling server running on port ${port}`);
+});

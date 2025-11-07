@@ -2,7 +2,7 @@
   "name": "webrtc-http-signaling",
   "version": "1.0.0",
   "description": "WebRTC signaling server using HTTP for SDP and ICE exchange",
-  "main": "http-signaling-server.js",
+  "main": "signaling-server.js",
   "scripts": {
     "start": "node signaling-server.js"
   },
@@ -23,4 +23,5 @@
   "author": "Joshua",
   "license": "MIT"
 }
+
 

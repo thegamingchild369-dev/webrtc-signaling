@@ -20,7 +20,7 @@ wss.on('connection', socket => {
         if (id !== clientId) {
           socket.send(JSON.stringify({ type: "peer", id }));
         }
-      }
+      });
 
       // Notify existing peers of new client
       Object.entries(rooms[roomId]).forEach(([id, peer]) => {

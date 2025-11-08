@@ -13,7 +13,13 @@ app.get('/', (req, res) => {
   res.send("✅ HTTP signaling server is running");
 });
 
-// Room status (optional diagnostics)
+// Get list of active rooms ✅ NEW
+app.get('/rooms', (req, res) => {
+  const activeRooms = Object.keys(rooms);
+  res.json({ rooms: activeRooms });
+});
+
+// Diagnostics (optional)
 app.get('/status', (req, res) => {
   res.json({ rooms });
 });
@@ -53,12 +59,18 @@ app.post('/poll', (req, res) => {
   res.json({ messages });
 });
 
-// Leave a room
+// Leave room
 app.post('/leave', (req, res) => {
   const { room, clientId } = req.body;
   if (rooms[room]) {
     delete rooms[room][clientId];
-    if (Object.keys(rooms[room]).length === 0) delete rooms[room];
+
+    // ✅ Auto delete empty rooms
+    if (Object.keys(rooms[room]).length === 0) {
+      delete rooms[room];
+      console.log(`🗑 Room ${room} deleted (empty)`);
+    }
+
     console.log(`👋 ${clientId} left room ${room}`);
   }
   res.sendStatus(200);

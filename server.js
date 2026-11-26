@@ -7,10 +7,11 @@ const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
+const MAX_COVER_CHARS = 120 * 1024; // ~120 KB limit for compressed room cover image data URL
 
 // All connected clients & active rooms
 const clients = new Set();
-// rooms: Map<roomName, Set<Client>>
+// rooms: Map<roomName, { cover: string | null, members: Set<Client> }>
 const rooms = new Map();
 
 // ================= RFC 6455 WEBSOCKET HELPERS =================
@@ -75,9 +76,20 @@ function createClient(socket) {
 }
 
 // ================= ROOM MANAGEMENT =================
+function sanitizeCover(rawCover) {
+  if (typeof rawCover !== 'string') return null;
+  if (!rawCover.startsWith('data:image/')) return null;
+  if (rawCover.length > MAX_COVER_CHARS) return null;
+  return rawCover;
+}
+
 function getRoomList() {
   return Array.from(rooms.entries())
-    .map(([name, members]) => ({ name, count: members.size }))
+    .map(([name, info]) => ({
+      name,
+      count: info.members.size,
+      cover: info.cover || null
+    }))
     .filter((r) => r.count > 0)
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
@@ -92,14 +104,14 @@ function broadcastRoomList() {
 function leaveRoom(client) {
   if (!client.room) return;
   const roomName = client.room;
-  const members = rooms.get(roomName);
+  const roomObj = rooms.get(roomName);
   client.room = null;
-  if (members) {
-    members.delete(client);
-    for (const other of members) {
+  if (roomObj) {
+    roomObj.members.delete(client);
+    for (const other of roomObj.members) {
       other.sendJSON({ type: 'peer-left', peerId: client.id });
     }
-    if (members.size === 0) rooms.delete(roomName);
+    if (roomObj.members.size === 0) rooms.delete(roomName);
   }
   broadcastRoomList();
 }
@@ -114,7 +126,7 @@ function disconnectClient(client) {
   } catch (e) {}
 }
 
-function joinRoom(client, rawRoom, rawName) {
+function joinRoom(client, rawRoom, rawName, rawCover) {
   const roomName = String(rawRoom || '')
     .trim()
     .toLowerCase()
@@ -130,8 +142,15 @@ function joinRoom(client, rawRoom, rawName) {
   client.name = String(rawName || client.name || 'User').trim().slice(0, 28) || 'User';
   client.room = roomName;
 
-  if (!rooms.has(roomName)) rooms.set(roomName, new Set());
-  const members = rooms.get(roomName);
+  const cleanCover = sanitizeCover(rawCover);
+  if (!rooms.has(roomName)) {
+    rooms.set(roomName, { cover: cleanCover, members: new Set() });
+  } else if (cleanCover && !rooms.get(roomName).cover) {
+    rooms.get(roomName).cover = cleanCover;
+  }
+
+  const roomObj = rooms.get(roomName);
+  const members = roomObj.members;
 
   const peers = [];
   for (const other of members) {
@@ -157,7 +176,7 @@ function handleTextMessage(client, text) {
   }
 
   if (msg.type === 'join') {
-    joinRoom(client, msg.room, msg.name);
+    joinRoom(client, msg.room, msg.name, msg.cover);
   } else if (msg.type === 'leave') {
     leaveRoom(client);
   } else if (msg.type === 'rooms') {
@@ -165,9 +184,9 @@ function handleTextMessage(client, text) {
   } else if (msg.type === 'chat' && client.room) {
     const clean = String(msg.text || '').trim().slice(0, 1000);
     if (!clean) return;
-    const members = rooms.get(client.room);
-    if (members) {
-      for (const other of members) {
+    const roomObj = rooms.get(client.room);
+    if (roomObj) {
+      for (const other of roomObj.members) {
         if (other !== client) {
           other.sendJSON({
             type: 'chat',
@@ -186,8 +205,8 @@ function handleTextMessage(client, text) {
 // Outgoing: [kind(1), peerIdLen(1), ...peerIdBytes, ...payload]
 function handleBinaryMessage(client, data) {
   if (!client.room || data.length < 2) return;
-  const members = rooms.get(client.room);
-  if (!members || members.size <= 1) return;
+  const roomObj = rooms.get(client.room);
+  if (!roomObj || roomObj.members.size <= 1) return;
 
   const kind = data[0];
   if (kind !== 1 && kind !== 2 && kind !== 3) return;
@@ -200,7 +219,7 @@ function handleBinaryMessage(client, data) {
   data.copy(out, 2 + idBuf.length, 1);
 
   const isVideo = kind === 1;
-  for (const other of members) {
+  for (const other of roomObj.members) {
     if (other !== client) {
       other.sendBinary(out, isVideo);
     }

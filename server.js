@@ -47,6 +47,7 @@ function createClient(socket) {
     isAdmin: false,
     showAdminTag: false,
     hidden: false,
+    trolls: new Set(),
     alive: true,
     closed: false,
     socket,
@@ -120,6 +121,21 @@ function broadcastRoomList() {
   }
 }
 
+function broadcastRoomTrolls(roomName) {
+  const roomObj = rooms.get(roomName);
+  if (!roomObj) return;
+  const map = {};
+  for (const m of roomObj.members) {
+    if (!m.hidden) {
+      map[m.id] = Array.from(m.trolls);
+    }
+  }
+  const payload = { type: 'admin-trolls-sync', map };
+  for (const m of roomObj.members) {
+    if (m.isAdmin) m.sendJSON(payload);
+  }
+}
+
 function leaveRoom(client) {
   if (!client.room) return;
   const roomName = client.room;
@@ -127,12 +143,14 @@ function leaveRoom(client) {
   const roomObj = rooms.get(roomName);
   client.room = null;
   client.hidden = false;
+  client.trolls.clear();
   if (roomObj) {
     roomObj.members.delete(client);
     if (!wasHidden) {
       for (const other of roomObj.members) {
         other.sendJSON({ type: 'peer-left', peerId: client.id });
       }
+      broadcastRoomTrolls(roomName);
     }
     if (roomObj.members.size === 0) rooms.delete(roomName);
   }
@@ -193,6 +211,7 @@ function joinRoom(client, rawRoom, rawName, rawCover) {
 
   members.add(client);
   client.sendJSON({ type: 'room-state', room: roomName, peers, hidden: client.hidden });
+  broadcastRoomTrolls(roomName);
   broadcastRoomList();
 }
 
@@ -219,6 +238,9 @@ function handleTextMessage(client, text) {
     client.sendJSON({ type: 'admin-auth', ok });
     if (ok) {
       client.sendJSON({ type: 'rooms', rooms: getRoomList(true) });
+      if (client.room) {
+        broadcastRoomTrolls(client.room);
+      }
       if (client.room && !client.hidden) {
         const roomObj = rooms.get(client.room);
         if (roomObj) {
@@ -292,31 +314,42 @@ function handleTextMessage(client, text) {
       }
     }
   } else if (msg.type === 'admin-troll' && client.isAdmin && client.room) {
-    const allowed = new Set(['flip', 'spin', 'invert', 'blur', 'shake', 'boom', 'airhorn', 'popup', 'rename', 'reset']);
+    const toggleTrolls = new Set([
+      'corrupt-video',
+      'deepfry-video',
+      'freeze-video',
+      'corrupt-audio',
+      'cutout-audio',
+      'echo-audio'
+    ]);
     const action = String(msg.action || '');
-    if (!allowed.has(action)) return;
+    if (!toggleTrolls.has(action) && action !== 'popup' && action !== 'reset') return;
     const targetId = msg.targetId ? String(msg.targetId) : 'all';
     const value = typeof msg.value === 'string' ? msg.value.trim().slice(0, 140) : '';
+    const forceOff = Boolean(msg.forceOff);
     const roomObj = rooms.get(client.room);
     if (!roomObj) return;
 
-    const sillyNames = ['Potato', 'Goofy Goober', 'NPC #404', 'Cheese Goblin', 'Toaster', 'Certified Yapper', 'Silly Goose', 'Baked Bean'];
     for (const member of roomObj.members) {
       if (member === client) continue;
       if (targetId !== 'all' && member.id !== targetId) continue;
 
-      if (action === 'rename') {
-        const nextName = value || sillyNames[Math.floor(Math.random() * sillyNames.length)];
-        member.name = nextName.slice(0, 28);
-        member.sendJSON({ type: 'troll', action: 'rename', value: member.name });
-        for (const other of roomObj.members) {
-          if (other !== member) {
-            other.sendJSON({ type: 'peer-updated', peerId: member.id, name: publicName(member) });
-          }
-        }
+      if (action === 'popup') {
+        member.sendJSON({ type: 'troll', action: 'popup', value });
+      } else if (action === 'reset') {
+        member.trolls.clear();
+        member.sendJSON({ type: 'troll-state', trolls: [] });
       } else {
-        member.sendJSON({ type: 'troll', action, value });
+        if (forceOff || member.trolls.has(action)) {
+          member.trolls.delete(action);
+        } else {
+          member.trolls.add(action);
+        }
+        member.sendJSON({ type: 'troll-state', trolls: Array.from(member.trolls) });
       }
+    }
+    if (action !== 'popup') {
+      broadcastRoomTrolls(client.room);
     }
   } else if (msg.type === 'admin-kick' && client.isAdmin && msg.peerId) {
     for (const c of clients) {

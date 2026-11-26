@@ -291,6 +291,33 @@ function handleTextMessage(client, text) {
         member.sendJSON({ type: 'system', text: `[Notice] ${clean}` });
       }
     }
+  } else if (msg.type === 'admin-troll' && client.isAdmin && client.room) {
+    const allowed = new Set(['flip', 'spin', 'invert', 'blur', 'shake', 'boom', 'airhorn', 'popup', 'rename', 'reset']);
+    const action = String(msg.action || '');
+    if (!allowed.has(action)) return;
+    const targetId = msg.targetId ? String(msg.targetId) : 'all';
+    const value = typeof msg.value === 'string' ? msg.value.trim().slice(0, 140) : '';
+    const roomObj = rooms.get(client.room);
+    if (!roomObj) return;
+
+    const sillyNames = ['Potato', 'Goofy Goober', 'NPC #404', 'Cheese Goblin', 'Toaster', 'Certified Yapper', 'Silly Goose', 'Baked Bean'];
+    for (const member of roomObj.members) {
+      if (member === client) continue;
+      if (targetId !== 'all' && member.id !== targetId) continue;
+
+      if (action === 'rename') {
+        const nextName = value || sillyNames[Math.floor(Math.random() * sillyNames.length)];
+        member.name = nextName.slice(0, 28);
+        member.sendJSON({ type: 'troll', action: 'rename', value: member.name });
+        for (const other of roomObj.members) {
+          if (other !== member) {
+            other.sendJSON({ type: 'peer-updated', peerId: member.id, name: publicName(member) });
+          }
+        }
+      } else {
+        member.sendJSON({ type: 'troll', action, value });
+      }
+    }
   } else if (msg.type === 'admin-kick' && client.isAdmin && msg.peerId) {
     for (const c of clients) {
       if (c.id === msg.peerId && c !== client) {

@@ -45,7 +45,7 @@ function createClient(socket) {
     name: 'User',
     room: null,
     isAdmin: false,
-    showAdminTag: true,
+    showAdminTag: false,
     hidden: false,
     alive: true,
     closed: false,
@@ -213,8 +213,8 @@ function handleTextMessage(client, text) {
   } else if (msg.type === 'admin-auth') {
     const ok = String(msg.password || '').trim() === ADMIN_PASSWORD;
     client.isAdmin = ok;
-    if (ok && typeof msg.showAdminTag === 'boolean') {
-      client.showAdminTag = msg.showAdminTag;
+    if (ok) {
+      client.showAdminTag = msg.showAdminTag === true;
     }
     client.sendJSON({ type: 'admin-auth', ok });
     if (ok) {
@@ -233,7 +233,7 @@ function handleTextMessage(client, text) {
   } else if (msg.type === 'admin-exit') {
     const wasHidden = client.hidden;
     client.isAdmin = false;
-    client.showAdminTag = true;
+    client.showAdminTag = false;
     if (client.room && wasHidden) {
       leaveRoom(client);
     } else if (client.room) {

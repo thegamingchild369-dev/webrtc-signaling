@@ -6,7 +6,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin 5923';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin5923';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
@@ -45,6 +45,8 @@ function createClient(socket) {
     name: 'User',
     room: null,
     isAdmin: false,
+    showAdminTag: true,
+    hidden: false,
     alive: true,
     closed: false,
     socket,
@@ -86,33 +88,51 @@ function sanitizeCover(rawCover) {
   return rawCover;
 }
 
-function getRoomList() {
+function publicName(client) {
+  return client.isAdmin && client.showAdminTag ? `${client.name} (admin)` : client.name;
+}
+
+function getRoomList(forAdmin = false) {
   return Array.from(rooms.entries())
-    .map(([name, info]) => ({
-      name,
-      count: info.members.size,
-      cover: info.cover || null
-    }))
-    .filter((r) => r.count > 0)
+    .map(([name, info]) => {
+      let visibleCount = 0;
+      let hiddenCount = 0;
+      for (const m of info.members) {
+        if (m.hidden) hiddenCount++;
+        else visibleCount++;
+      }
+      return {
+        name,
+        count: visibleCount,
+        ...(forAdmin ? { hiddenCount } : {}),
+        cover: info.cover || null
+      };
+    })
+    .filter((r) => (forAdmin ? r.count + (r.hiddenCount || 0) > 0 : r.count > 0))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
 
 function broadcastRoomList() {
-  const payload = { type: 'rooms', rooms: getRoomList() };
+  const publicPayload = { type: 'rooms', rooms: getRoomList(false) };
+  const adminPayload = { type: 'rooms', rooms: getRoomList(true) };
   for (const c of clients) {
-    c.sendJSON(payload);
+    c.sendJSON(c.isAdmin ? adminPayload : publicPayload);
   }
 }
 
 function leaveRoom(client) {
   if (!client.room) return;
   const roomName = client.room;
+  const wasHidden = client.hidden;
   const roomObj = rooms.get(roomName);
   client.room = null;
+  client.hidden = false;
   if (roomObj) {
     roomObj.members.delete(client);
-    for (const other of roomObj.members) {
-      other.sendJSON({ type: 'peer-left', peerId: client.id });
+    if (!wasHidden) {
+      for (const other of roomObj.members) {
+        other.sendJSON({ type: 'peer-left', peerId: client.id });
+      }
     }
     if (roomObj.members.size === 0) rooms.delete(roomName);
   }
@@ -144,6 +164,8 @@ function joinRoom(client, rawRoom, rawName, rawCover) {
 
   client.name = String(rawName || client.name || 'User').trim().slice(0, 28) || 'User';
   client.room = roomName;
+  // Admins join silently in stealth mode until they explicitly enable presence
+  client.hidden = Boolean(client.isAdmin);
 
   const cleanCover = sanitizeCover(rawCover);
   if (!rooms.has(roomName)) {
@@ -157,16 +179,20 @@ function joinRoom(client, rawRoom, rawName, rawCover) {
 
   const peers = [];
   for (const other of members) {
-    peers.push({ peerId: other.id, name: other.name });
-    other.sendJSON({
-      type: 'peer-joined',
-      peerId: client.id,
-      name: client.name
-    });
+    if (!other.hidden) {
+      peers.push({ peerId: other.id, name: publicName(other) });
+    }
+    if (!client.hidden) {
+      other.sendJSON({
+        type: 'peer-joined',
+        peerId: client.id,
+        name: publicName(client)
+      });
+    }
   }
 
   members.add(client);
-  client.sendJSON({ type: 'room-state', room: roomName, peers });
+  client.sendJSON({ type: 'room-state', room: roomName, peers, hidden: client.hidden });
   broadcastRoomList();
 }
 
@@ -183,13 +209,88 @@ function handleTextMessage(client, text) {
   } else if (msg.type === 'leave') {
     leaveRoom(client);
   } else if (msg.type === 'rooms') {
-    client.sendJSON({ type: 'rooms', rooms: getRoomList() });
+    client.sendJSON({ type: 'rooms', rooms: getRoomList(client.isAdmin) });
   } else if (msg.type === 'admin-auth') {
     const ok = String(msg.password || '').trim() === ADMIN_PASSWORD;
     client.isAdmin = ok;
+    if (ok && typeof msg.showAdminTag === 'boolean') {
+      client.showAdminTag = msg.showAdminTag;
+    }
     client.sendJSON({ type: 'admin-auth', ok });
+    if (ok) {
+      client.sendJSON({ type: 'rooms', rooms: getRoomList(true) });
+      if (client.room && !client.hidden) {
+        const roomObj = rooms.get(client.room);
+        if (roomObj) {
+          for (const other of roomObj.members) {
+            if (other !== client) {
+              other.sendJSON({ type: 'peer-updated', peerId: client.id, name: publicName(client) });
+            }
+          }
+        }
+      }
+    }
   } else if (msg.type === 'admin-exit') {
+    const wasHidden = client.hidden;
     client.isAdmin = false;
+    client.showAdminTag = true;
+    if (client.room && wasHidden) {
+      leaveRoom(client);
+    } else if (client.room) {
+      const roomObj = rooms.get(client.room);
+      if (roomObj) {
+        for (const other of roomObj.members) {
+          if (other !== client) {
+            other.sendJSON({ type: 'peer-updated', peerId: client.id, name: publicName(client) });
+          }
+        }
+      }
+    }
+    client.sendJSON({ type: 'rooms', rooms: getRoomList(false) });
+  } else if (msg.type === 'admin-presence' && client.isAdmin && client.room) {
+    const wantVisible = Boolean(msg.visible);
+    const roomObj = rooms.get(client.room);
+    if (!roomObj) return;
+    if (wantVisible && client.hidden) {
+      client.hidden = false;
+      for (const other of roomObj.members) {
+        if (other !== client) {
+          other.sendJSON({ type: 'peer-joined', peerId: client.id, name: publicName(client) });
+        }
+      }
+      client.sendJSON({ type: 'admin-presence', visible: true });
+      broadcastRoomList();
+    } else if (!wantVisible && !client.hidden) {
+      client.hidden = true;
+      for (const other of roomObj.members) {
+        if (other !== client) {
+          other.sendJSON({ type: 'peer-left', peerId: client.id });
+        }
+      }
+      client.sendJSON({ type: 'admin-presence', visible: false });
+      broadcastRoomList();
+    }
+  } else if (msg.type === 'admin-tag' && client.isAdmin) {
+    client.showAdminTag = Boolean(msg.showAdminTag);
+    if (client.room && !client.hidden) {
+      const roomObj = rooms.get(client.room);
+      if (roomObj) {
+        for (const other of roomObj.members) {
+          if (other !== client) {
+            other.sendJSON({ type: 'peer-updated', peerId: client.id, name: publicName(client) });
+          }
+        }
+      }
+    }
+  } else if (msg.type === 'admin-announce' && client.isAdmin && client.room) {
+    const clean = String(msg.text || '').trim().slice(0, 500);
+    if (!clean) return;
+    const roomObj = rooms.get(client.room);
+    if (roomObj) {
+      for (const member of roomObj.members) {
+        member.sendJSON({ type: 'system', text: `[Notice] ${clean}` });
+      }
+    }
   } else if (msg.type === 'admin-kick' && client.isAdmin && msg.peerId) {
     for (const c of clients) {
       if (c.id === msg.peerId && c !== client) {
@@ -203,6 +304,7 @@ function handleTextMessage(client, text) {
     if (roomObj) {
       for (const member of Array.from(roomObj.members)) {
         member.room = null;
+        member.hidden = false;
         member.sendJSON({ type: 'kicked', reason: `Room "${msg.room}" was closed by admin.` });
       }
       rooms.delete(String(msg.room));
@@ -213,7 +315,7 @@ function handleTextMessage(client, text) {
     if (!clean) return;
     const roomObj = rooms.get(client.room);
     if (roomObj) {
-      const senderName = client.isAdmin ? `[ADMIN] ${client.name}` : client.name;
+      const senderName = publicName(client);
       for (const other of roomObj.members) {
         if (other !== client) {
           other.sendJSON({
@@ -238,6 +340,8 @@ function handleBinaryMessage(client, data) {
 
   const kind = data[0];
   if (kind !== 1 && kind !== 2 && kind !== 3) return;
+  // Never leak video or audio while an admin is in stealth mode
+  if (client.hidden && (kind === 1 || kind === 2)) return;
 
   const idBuf = Buffer.from(client.id, 'ascii');
   const out = Buffer.allocUnsafe(2 + idBuf.length + (data.length - 1));

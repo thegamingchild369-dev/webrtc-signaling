@@ -1,5 +1,5 @@
 {
-  "name": "whappchapp-connection-server",
+  "name": "whatsnap-connection-server",
   "version": "1.0.0",
   "description": "Headless WebSocket connection server for Render",
   "main": "server.js",

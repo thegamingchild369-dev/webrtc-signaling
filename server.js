@@ -1,12 +1,12 @@
 // Headless backend WebSocket connection server for Render.
-// Serves no frontend HTML — only WebSocket (/ws) and JSON health/rooms endpoints.
+// Serves no frontend HTML — only WebSocket (/ws), POST /leave, and JSON /health + /rooms.
 const http = require('http');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const MAX_FRAME_BYTES = 1024 * 1024; // 1 MB safety limit
+const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
 
 // All connected clients & active rooms
 const clients = new Set();
@@ -41,8 +41,6 @@ function createClient(socket) {
     id: crypto.randomBytes(4).toString('hex'),
     name: 'User',
     room: null,
-    camOn: true,
-    micOn: true,
     alive: true,
     closed: false,
     socket,
@@ -106,6 +104,16 @@ function leaveRoom(client) {
   broadcastRoomList();
 }
 
+function disconnectClient(client) {
+  if (!client || client.closed) return;
+  client.closed = true;
+  leaveRoom(client);
+  clients.delete(client);
+  try {
+    if (!client.socket.destroyed) client.socket.destroy();
+  } catch (e) {}
+}
+
 function joinRoom(client, rawRoom, rawName) {
   const roomName = String(rawRoom || '')
     .trim()
@@ -127,18 +135,11 @@ function joinRoom(client, rawRoom, rawName) {
 
   const peers = [];
   for (const other of members) {
-    peers.push({
-      peerId: other.id,
-      name: other.name,
-      camOn: other.camOn,
-      micOn: other.micOn
-    });
+    peers.push({ peerId: other.id, name: other.name });
     other.sendJSON({
       type: 'peer-joined',
       peerId: client.id,
-      name: client.name,
-      camOn: client.camOn,
-      micOn: client.micOn
+      name: client.name
     });
   }
 
@@ -156,31 +157,13 @@ function handleTextMessage(client, text) {
   }
 
   if (msg.type === 'join') {
-    if (typeof msg.camOn === 'boolean') client.camOn = msg.camOn;
-    if (typeof msg.micOn === 'boolean') client.micOn = msg.micOn;
     joinRoom(client, msg.room, msg.name);
   } else if (msg.type === 'leave') {
     leaveRoom(client);
   } else if (msg.type === 'rooms') {
     client.sendJSON({ type: 'rooms', rooms: getRoomList() });
-  } else if (msg.type === 'media-state' && client.room) {
-    client.camOn = Boolean(msg.camOn);
-    client.micOn = Boolean(msg.micOn);
-    const members = rooms.get(client.room);
-    if (members) {
-      for (const other of members) {
-        if (other !== client) {
-          other.sendJSON({
-            type: 'peer-media',
-            peerId: client.id,
-            camOn: client.camOn,
-            micOn: client.micOn
-          });
-        }
-      }
-    }
   } else if (msg.type === 'chat' && client.room) {
-    const clean = String(msg.text || '').trim().slice(0, 500);
+    const clean = String(msg.text || '').trim().slice(0, 1000);
     if (!clean) return;
     const members = rooms.get(client.room);
     if (members) {
@@ -199,7 +182,7 @@ function handleTextMessage(client, text) {
 }
 
 // Binary relay:
-// Incoming: [kind(1: 1=video, 2=audio), ...payload]
+// Incoming: [kind(1: 1=video, 2=audio, 3=file), ...payload]
 // Outgoing: [kind(1), peerIdLen(1), ...peerIdBytes, ...payload]
 function handleBinaryMessage(client, data) {
   if (!client.room || data.length < 2) return;
@@ -207,7 +190,7 @@ function handleBinaryMessage(client, data) {
   if (!members || members.size <= 1) return;
 
   const kind = data[0];
-  if (kind !== 1 && kind !== 2) return;
+  if (kind !== 1 && kind !== 2 && kind !== 3) return;
 
   const idBuf = Buffer.from(client.id, 'ascii');
   const out = Buffer.allocUnsafe(2 + idBuf.length + (data.length - 1));
@@ -227,7 +210,7 @@ function handleBinaryMessage(client, data) {
 // ================= HEADLESS HTTP + WEBSOCKET SERVER =================
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -239,14 +222,39 @@ const server = http.createServer((req, res) => {
   const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ ok: true, service: 'connection-server', rooms: rooms.size, clients: clients.size }));
     return;
   }
 
   if (req.method === 'GET' && parsed.pathname === '/rooms') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(getRoomList()));
+    return;
+  }
+
+  // Instant tab-close disconnect beacon endpoint (called via navigator.sendBeacon)
+  if (req.method === 'POST' && parsed.pathname === '/leave') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 4096) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        const { peerId } = JSON.parse(body || '{}');
+        if (peerId) {
+          for (const c of clients) {
+            if (c.id === peerId) {
+              disconnectClient(c);
+              break;
+            }
+          }
+        }
+      } catch (e) {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    });
     return;
   }
 
@@ -306,8 +314,7 @@ server.on('upgrade', (req, socket, head) => {
       }
 
       if (len > MAX_FRAME_BYTES) {
-        client.close();
-        socket.destroy();
+        disconnectClient(client);
         return;
       }
 
@@ -329,7 +336,7 @@ server.on('upgrade', (req, socket, head) => {
       client.alive = true;
 
       if (opcode === 0x8) {
-        client.close();
+        disconnectClient(client);
         return;
       } else if (opcode === 0x9) {
         try { socket.write(encodeFrame(0xA, payload)); } catch (e) {}
@@ -369,30 +376,23 @@ server.on('upgrade', (req, socket, head) => {
     processBuffer();
   }
 
-  const cleanup = () => {
-    if (client.closed) return;
-    client.closed = true;
-    leaveRoom(client);
-    clients.delete(client);
-  };
-
+  const cleanup = () => disconnectClient(client);
   socket.on('close', cleanup);
+  socket.on('end', cleanup);
   socket.on('error', cleanup);
 });
 
-// Keep WebSockets alive behind Render's proxy & clean up dead sockets
+// Keep WebSockets alive behind Render's proxy & clean up dead sockets quickly
 setInterval(() => {
   for (const c of clients) {
     if (!c.alive) {
-      c.socket.destroy();
-      leaveRoom(c);
-      clients.delete(c);
+      disconnectClient(c);
       continue;
     }
     c.alive = false;
     c.ping();
   }
-}, 25000);
+}, 12000);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Headless connection server listening on port ${PORT}`);

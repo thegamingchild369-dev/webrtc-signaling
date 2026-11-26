@@ -318,6 +318,7 @@ function handleTextMessage(client, text) {
       'corrupt-video',
       'deepfry-video',
       'freeze-video',
+      'fnaf-twitch',
       'corrupt-audio',
       'cutout-audio',
       'echo-audio'

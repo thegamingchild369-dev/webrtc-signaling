@@ -6,6 +6,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin 5923';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
@@ -43,6 +44,7 @@ function createClient(socket) {
     id: crypto.randomBytes(4).toString('hex'),
     name: 'User',
     room: null,
+    isAdmin: false,
     alive: true,
     closed: false,
     socket,
@@ -182,17 +184,42 @@ function handleTextMessage(client, text) {
     leaveRoom(client);
   } else if (msg.type === 'rooms') {
     client.sendJSON({ type: 'rooms', rooms: getRoomList() });
+  } else if (msg.type === 'admin-auth') {
+    const ok = String(msg.password || '').trim() === ADMIN_PASSWORD;
+    client.isAdmin = ok;
+    client.sendJSON({ type: 'admin-auth', ok });
+  } else if (msg.type === 'admin-exit') {
+    client.isAdmin = false;
+  } else if (msg.type === 'admin-kick' && client.isAdmin && msg.peerId) {
+    for (const c of clients) {
+      if (c.id === msg.peerId && c !== client) {
+        leaveRoom(c);
+        c.sendJSON({ type: 'kicked', reason: 'Removed from room by admin.' });
+        break;
+      }
+    }
+  } else if (msg.type === 'admin-close-room' && client.isAdmin && msg.room) {
+    const roomObj = rooms.get(String(msg.room));
+    if (roomObj) {
+      for (const member of Array.from(roomObj.members)) {
+        member.room = null;
+        member.sendJSON({ type: 'kicked', reason: `Room "${msg.room}" was closed by admin.` });
+      }
+      rooms.delete(String(msg.room));
+      broadcastRoomList();
+    }
   } else if (msg.type === 'chat' && client.room) {
     const clean = String(msg.text || '').trim().slice(0, 1000);
     if (!clean) return;
     const roomObj = rooms.get(client.room);
     if (roomObj) {
+      const senderName = client.isAdmin ? `[ADMIN] ${client.name}` : client.name;
       for (const other of roomObj.members) {
         if (other !== client) {
           other.sendJSON({
             type: 'chat',
             from: client.id,
-            name: client.name,
+            name: senderName,
             text: clean
           });
         }

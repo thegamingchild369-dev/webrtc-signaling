@@ -1,6 +1,6 @@
-// Headless zero-dependency WebSocket (wss://) + HTTPS long-polling fallback server for Whatsnap on Render.
-// Serves no frontend HTML — handles WebSocket connections (/ws or /), HTTPS long-polling fallback (/poll/*),
-// rooms with cover images, live video/audio/file binary relay, and instant tab-close disconnect.
+// Headless zero-dependency encrypted WebSocket + HTTPS long-polling relay server.
+// All traffic (WS binary frames & HTTP fallback) uses ephemeral ECDH (P-256) + HKDF-SHA256 + AES-256-GCM
+// with masked handshakes, randomized packet padding, and neutral endpoints.
 const http = require('http');
 const crypto = require('crypto');
 
@@ -12,7 +12,9 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin5923';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
+const MAX_HANDSHAKE_BYTES = 512;
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
+const HANDSHAKE_TIMEOUT_MS = 10000;       // 10s limit to complete WS ECDH handshake
 const HEARTBEAT_MS = 25000;               // 25s heartbeat interval (tolerant of higher-latency proxies)
 const MAX_MISSED_PINGS = 2;               // ~50s grace before closing idle WS sockets
 const HTTP_POLL_HOLD_MS = 20000;          // 20s long-poll hold (well under Render/proxy HTTP timeouts)
@@ -20,9 +22,19 @@ const HTTP_BATCH_DELAY_MS = 20;           // Coalesce burst frames into one HTTP
 const HTTP_IDLE_TIMEOUT_MS = 45000;       // 45s idle timeout for HTTP polling clients
 const HTTP_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
-// All connected clients & active rooms
+// Encrypted inner envelope types (never visible in plaintext on the wire)
+const INNER_JSON = 1;
+const INNER_BINARY = 2;
+const INNER_CHAFF = 3;
+const INNER_BATCH = 4;
+
+const KDF_INFO = Buffer.from('sync-v2-session', 'utf8');
+
+// All authenticated clients, session lookups & active rooms
 const clients = new Set();
-// HTTP polling client lookup: Map<peerId, Client>
+// Lookup by opaque session ID (for both WS & HTTP encrypted close beacons)
+const sessionsById = new Map();
+// HTTP polling client lookup: Map<sessionId, Client>
 const httpClients = new Map();
 // rooms: Map<roomName, { cover: string | null, members: Set<Client> }>
 const rooms = new Map();
@@ -42,8 +54,170 @@ function applyCorsHeaders(req, res) {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Client-Id, X-Client-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Max-Age', '86400');
   res.setHeader('Cache-Control', 'no-store');
+}
+
+// ================= APPLICATION-LAYER ENCRYPTION (ECDH P-256 + HKDF + AES-256-GCM) =================
+function randomInt(min, max) {
+  return min + crypto.randomInt(max - min + 1);
+}
+
+function deriveMask(nonce, label, length) {
+  const labelBuf = Buffer.from(label, 'utf8');
+  const out = Buffer.allocUnsafe(length);
+  let written = 0;
+  let counter = 0;
+  while (written < length) {
+    const block = crypto.createHash('sha256')
+      .update(nonce)
+      .update(labelBuf)
+      .update(Buffer.from([counter & 0xff]))
+      .digest();
+    const take = Math.min(block.length, length - written);
+    block.copy(out, written, 0, take);
+    written += take;
+    counter++;
+  }
+  return out;
+}
+
+function deriveSessionCrypto(sharedSecret, clientNonce, serverNonce) {
+  const salt = Buffer.concat([clientNonce, serverNonce]);
+  const okm = Buffer.from(crypto.hkdfSync('sha256', sharedSecret, salt, KDF_INFO, 80));
+  return {
+    c2sKey: okm.subarray(0, 32),
+    s2cKey: okm.subarray(32, 64),
+    c2sIvMask: okm.subarray(64, 72),
+    s2cIvMask: okm.subarray(72, 80),
+    txCounter: 0n
+  };
+}
+
+function computePadLength(innerType, payloadLen) {
+  if (innerType === INNER_JSON || innerType === INNER_CHAFF) {
+    const rem = (3 + payloadLen) % 128;
+    const align = rem === 0 ? 0 : (128 - rem);
+    return align + randomInt(32, 191);
+  }
+  if (innerType === INNER_BATCH) {
+    return randomInt(32, 223);
+  }
+  return randomInt(32, 287);
+}
+
+function encryptEnvelope(sessionCrypto, innerType, payloadBuf) {
+  const payload = Buffer.isBuffer(payloadBuf) ? payloadBuf : Buffer.from(payloadBuf || '');
+  const padLen = computePadLength(innerType, payload.length);
+  // Zero-filled buffer safely clears padding bytes; AES-GCM ciphertext is indistinguishable from random
+  const plain = Buffer.alloc(3 + payload.length + padLen);
+  plain[0] = innerType;
+  plain.writeUInt16BE(padLen, 1);
+  if (payload.length > 0) {
+    payload.copy(plain, 3);
+  }
+
+  sessionCrypto.txCounter += 1n;
+  const iv = Buffer.allocUnsafe(12);
+  crypto.randomBytes(4).copy(iv, 0);
+  const cntBuf = Buffer.allocUnsafe(8);
+  cntBuf.writeBigUInt64BE(sessionCrypto.txCounter, 0);
+  for (let i = 0; i < 8; i++) {
+    iv[4 + i] = cntBuf[i] ^ sessionCrypto.s2cIvMask[i];
+  }
+
+  const cipher = crypto.createCipheriv('aes-256-gcm', sessionCrypto.s2cKey, iv);
+  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, ct, tag]);
+}
+
+function decryptEnvelope(sessionCrypto, encryptedBuf) {
+  if (!sessionCrypto || !Buffer.isBuffer(encryptedBuf) || encryptedBuf.length < 12 + 3 + 16) {
+    return null;
+  }
+  const iv = encryptedBuf.subarray(0, 12);
+  const tag = encryptedBuf.subarray(encryptedBuf.length - 16);
+  const ct = encryptedBuf.subarray(12, encryptedBuf.length - 16);
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', sessionCrypto.c2sKey, iv);
+    decipher.setAuthTag(tag);
+    const plain = Buffer.concat([decipher.update(ct), decipher.final()]);
+    if (plain.length < 3) return null;
+    const innerType = plain[0];
+    const padLen = plain.readUInt16BE(1);
+    if (3 + padLen > plain.length) return null;
+    const payload = plain.subarray(3, plain.length - padLen);
+    return { innerType, payload };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Parse ClientHello: [clientNonce(16) || maskedClientPub(65) || maskedPadLen(1) || randomPad(padLen)]
+function processClientHandshake(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 82 || buf.length > MAX_HANDSHAKE_BYTES) {
+    return null;
+  }
+  const clientNonce = buf.subarray(0, 16);
+  const maskC = deriveMask(clientNonce, 'hs-c', 66);
+  const clientPubRaw = Buffer.allocUnsafe(65);
+  for (let i = 0; i < 65; i++) {
+    clientPubRaw[i] = buf[16 + i] ^ maskC[i];
+  }
+  const padLen = buf[81] ^ maskC[65];
+  if (clientPubRaw[0] !== 0x04 || 82 + padLen !== buf.length) {
+    return null;
+  }
+
+  let sharedSecret;
+  let serverPubRaw;
+  try {
+    const ecdh = crypto.createECDH('prime256v1');
+    serverPubRaw = ecdh.generateKeys();
+    sharedSecret = ecdh.computeSecret(clientPubRaw);
+  } catch (e) {
+    return null;
+  }
+
+  const serverNonce = crypto.randomBytes(16);
+  const sessionCrypto = deriveSessionCrypto(sharedSecret, clientNonce, serverNonce);
+  return { serverNonce, serverPubRaw, sessionCrypto };
+}
+
+// Build WS ServerHello: [serverNonce(16) || maskedServerPub(65) || maskedPadLen(1) || randomPad]
+function buildWsServerHello(serverNonce, serverPubRaw) {
+  const padLen = randomInt(24, 87);
+  const maskS = deriveMask(serverNonce, 'hs-s', 66);
+  const out = Buffer.allocUnsafe(16 + 65 + 1 + padLen);
+  serverNonce.copy(out, 0);
+  for (let i = 0; i < 65; i++) {
+    out[16 + i] = serverPubRaw[i] ^ maskS[i];
+  }
+  out[81] = padLen ^ maskS[65];
+  crypto.randomBytes(padLen).copy(out, 82);
+  return out;
+}
+
+// Build HTTP Sync ServerHello: [serverNonce(16) || maskedServerPub(65) || maskedInitLen(4) || encInit || randomPad]
+function buildHttpServerHello(serverNonce, serverPubRaw, encInit) {
+  const padLen = randomInt(24, 87);
+  const maskS = deriveMask(serverNonce, 'hs-s', 69);
+  const lenBuf = Buffer.allocUnsafe(4);
+  lenBuf.writeUInt32BE(encInit.length, 0);
+
+  const out = Buffer.allocUnsafe(16 + 65 + 4 + encInit.length + padLen);
+  serverNonce.copy(out, 0);
+  for (let i = 0; i < 65; i++) {
+    out[16 + i] = serverPubRaw[i] ^ maskS[i];
+  }
+  for (let i = 0; i < 4; i++) {
+    out[81 + i] = lenBuf[i] ^ maskS[65 + i];
+  }
+  encInit.copy(out, 85);
+  crypto.randomBytes(padLen).copy(out, 85 + encInit.length);
+  return out;
 }
 
 // ================= RFC 6455 WEBSOCKET HELPERS =================
@@ -69,7 +243,7 @@ function encodeFrame(opcode, payloadBuf) {
   return Buffer.concat([header, payload]);
 }
 
-function encodeHttpBatch(items) {
+function encodeInnerBatch(items) {
   let total = 0;
   for (const item of items) {
     total += 5 + item.payload.length;
@@ -88,7 +262,11 @@ function encodeHttpBatch(items) {
 function createWsClient(socket) {
   return {
     id: crypto.randomBytes(4).toString('hex'),
+    sessionId: crypto.randomBytes(16).toString('hex'),
     transport: 'ws',
+    crypto: null,
+    cryptoReady: false,
+    handshakeTimer: null,
     name: 'User',
     room: null,
     isAdmin: false,
@@ -104,22 +282,24 @@ function createWsClient(socket) {
       this.lastSeen = Date.now();
     },
     sendJSON(obj) {
-      if (this.closed || this.socket.destroyed) return;
+      if (this.closed || this.socket.destroyed || !this.cryptoReady) return;
       try {
-        this.socket.write(encodeFrame(0x1, Buffer.from(JSON.stringify(obj), 'utf8')));
+        const enc = encryptEnvelope(this.crypto, INNER_JSON, Buffer.from(JSON.stringify(obj), 'utf8'));
+        this.socket.write(encodeFrame(0x2, enc));
       } catch (e) {}
     },
     sendBinary(buf, dropIfBackedUp = false) {
-      if (this.closed || this.socket.destroyed) return;
+      if (this.closed || this.socket.destroyed || !this.cryptoReady) return;
       if (dropIfBackedUp && this.socket.writableLength > 192 * 1024) return;
       try {
-        this.socket.write(encodeFrame(0x2, buf));
+        const enc = encryptEnvelope(this.crypto, INNER_BINARY, buf);
+        this.socket.write(encodeFrame(0x2, enc));
       } catch (e) {}
     },
     ping() {
-      if (this.closed || this.socket.destroyed) return;
+      if (this.closed || this.socket.destroyed || !this.cryptoReady) return;
       try {
-        // Send both RFC 6455 control ping and an app-level JSON ping so proxies that strip control frames still keep alive
+        // Send both RFC 6455 control ping and an encrypted app-level ping for strict proxy keepalive
         this.socket.write(encodeFrame(0x9, Buffer.alloc(0)));
         this.sendJSON({ type: 'ping', ts: Date.now() });
       } catch (e) {}
@@ -137,11 +317,13 @@ function createWsClient(socket) {
   };
 }
 
-function createHttpClient() {
+function createHttpClient(sessionCrypto) {
   const client = {
     id: crypto.randomBytes(4).toString('hex'),
-    token: crypto.randomBytes(12).toString('hex'),
+    sessionId: crypto.randomBytes(16).toString('hex'),
     transport: 'http',
+    crypto: sessionCrypto,
+    cryptoReady: true,
     name: 'User',
     room: null,
     isAdmin: false,
@@ -172,7 +354,9 @@ function createHttpClient() {
       }
       const items = this.queue.splice(0, this.queue.length);
       this.queuedBytes = 0;
-      const body = items.length ? encodeHttpBatch(items) : Buffer.alloc(0);
+      const body = items.length
+        ? encryptEnvelope(this.crypto, INNER_BATCH, encodeInnerBatch(items))
+        : encryptEnvelope(this.crypto, INNER_CHAFF, Buffer.alloc(0));
       try {
         if (!res.writableEnded) {
           res.writeHead(200, {
@@ -184,11 +368,10 @@ function createHttpClient() {
       } catch (e) {}
     },
     enqueue(frameType, payloadBuf, dropIfBackedUp = false) {
-      if (this.closed) return;
+      if (this.closed || !this.cryptoReady) return;
       if (dropIfBackedUp && (this.queue.length > 18 || this.queuedBytes > 384 * 1024)) {
         return;
       }
-      // Prevent unbounded memory growth if a polling client stalls
       while (this.queue.length > 0 && this.queuedBytes + payloadBuf.length > HTTP_MAX_QUEUE_BYTES) {
         const droppedIdx = this.queue.findIndex((item) => item.droppable);
         if (droppedIdx >= 0) {
@@ -202,8 +385,7 @@ function createHttpClient() {
       this.queuedBytes += payloadBuf.length;
 
       if (this.pollRes) {
-        if (frameType === 1 || !dropIfBackedUp) {
-          // Control/JSON/file packets flush immediately
+        if (frameType === INNER_JSON || !dropIfBackedUp) {
           this.flushPoll();
         } else if (!this.batchTimer) {
           this.batchTimer = setTimeout(() => this.flushPoll(), HTTP_BATCH_DELAY_MS);
@@ -225,8 +407,12 @@ function createHttpClient() {
         }
         try {
           if (!oldRes.writableEnded) {
-            oldRes.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': 0 });
-            oldRes.end();
+            const chaff = encryptEnvelope(this.crypto, INNER_CHAFF, Buffer.alloc(0));
+            oldRes.writeHead(200, {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': chaff.length
+            });
+            oldRes.end(chaff);
           }
         } catch (e) {}
       }
@@ -259,11 +445,11 @@ function createHttpClient() {
     },
     sendJSON(obj) {
       if (this.closed) return;
-      this.enqueue(1, Buffer.from(JSON.stringify(obj), 'utf8'), false);
+      this.enqueue(INNER_JSON, Buffer.from(JSON.stringify(obj), 'utf8'), false);
     },
     sendBinary(buf, dropIfBackedUp = false) {
       if (this.closed) return;
-      this.enqueue(2, Buffer.isBuffer(buf) ? buf : Buffer.from(buf), dropIfBackedUp);
+      this.enqueue(INNER_BINARY, Buffer.isBuffer(buf) ? buf : Buffer.from(buf), dropIfBackedUp);
     },
     ping() {},
     close() {
@@ -356,10 +542,17 @@ function leaveRoom(client) {
 function disconnectClient(client) {
   if (!client || client.closed) return;
   client.closed = true;
+  if (client.handshakeTimer) {
+    clearTimeout(client.handshakeTimer);
+    client.handshakeTimer = null;
+  }
   leaveRoom(client);
   clients.delete(client);
+  if (client.sessionId) {
+    sessionsById.delete(client.sessionId);
+  }
   if (client.transport === 'http') {
-    httpClients.delete(client.id);
+    httpClients.delete(client.sessionId);
     client.queue.length = 0;
     client.queuedBytes = 0;
     client.flushPoll();
@@ -432,6 +625,10 @@ function handleTextMessage(client, text) {
     return;
   }
   if (msg.type === 'pong') {
+    return;
+  }
+  if (msg.type === 'close') {
+    disconnectClient(client);
     return;
   }
 
@@ -603,9 +800,9 @@ function handleTextMessage(client, text) {
   }
 }
 
-// Binary relay:
+// Decrypted binary relay:
 // Incoming: [kind(1: 1=video, 2=audio, 3=file), ...payload]
-// Outgoing: [kind(1), peerIdLen(1), ...peerIdBytes, ...payload]
+// Outgoing: [kind(1), peerIdLen(1), ...peerIdBytes, ...payload] (re-encrypted per recipient)
 function handleBinaryMessage(client, data) {
   client.markAlive();
   if (!client.room || data.length < 2) return;
@@ -630,6 +827,21 @@ function handleBinaryMessage(client, data) {
       other.sendBinary(out, isVideo);
     }
   }
+}
+
+function handleDecryptedEnvelope(client, encryptedBuf) {
+  const envelope = decryptEnvelope(client.crypto, encryptedBuf);
+  if (!envelope) {
+    return false;
+  }
+  client.markAlive();
+  if (envelope.innerType === INNER_JSON) {
+    handleTextMessage(client, envelope.payload.toString('utf8'));
+  } else if (envelope.innerType === INNER_BINARY) {
+    handleBinaryMessage(client, envelope.payload);
+  }
+  // INNER_CHAFF is intentionally ignored after authentication
+  return true;
 }
 
 function readRequestBody(req, maxBytes) {
@@ -661,16 +873,15 @@ function readRequestBody(req, maxBytes) {
   });
 }
 
-function authenticateHttpClient(req, parsed) {
-  const id = parsed.searchParams.get('id') || req.headers['x-client-id'];
-  const token = parsed.searchParams.get('token') || req.headers['x-client-token'];
-  if (!id || !token) return null;
-  const client = httpClients.get(String(id));
-  if (!client || client.closed || client.token !== String(token)) return null;
+function authenticateHttpClient(parsed) {
+  const sid = parsed.searchParams.get('s');
+  if (!sid) return null;
+  const client = httpClients.get(String(sid));
+  if (!client || client.closed || !client.cryptoReady) return null;
   return client;
 }
 
-// ================= HEADLESS HTTP + WEBSOCKET + LONG-POLL SERVER =================
+// ================= HEADLESS ENCRYPTED HTTP + WEBSOCKET SERVER =================
 const server = http.createServer((req, res) => {
   applyCorsHeaders(req, res);
 
@@ -681,114 +892,129 @@ const server = http.createServer((req, res) => {
   }
 
   if (!isOriginAllowed(req.headers.origin)) {
-    res.writeHead(403, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Origin not allowed' }));
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('Forbidden');
     return;
   }
 
   const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
-  if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health' || parsed.pathname === '/api/health')) {
+  // Neutral status endpoint (also handles Render's / and /health checks without leaking app details)
+  if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health' || parsed.pathname === '/api/health' || parsed.pathname === '/v1/status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: true,
-      service: 'whatsnap-server',
-      transports: ['wss', 'http-poll'],
-      rooms: rooms.size,
-      clients: clients.size
-    }));
+    res.end('{"ok":true,"v":2,"m":1}');
     return;
   }
 
-  if (req.method === 'GET' && (parsed.pathname === '/rooms' || parsed.pathname === '/api/rooms')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getRoomList()));
+  // ---- Encrypted HTTPS Long-Polling Fallback Endpoints ----
+  // Opaque ECDH handshake + encrypted initial session state
+  if (req.method === 'POST' && parsed.pathname === '/v1/sync') {
+    readRequestBody(req, MAX_HANDSHAKE_BYTES)
+      .then((buf) => {
+        const hs = processClientHandshake(buf);
+        if (!hs) {
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+          return;
+        }
+        const client = createHttpClient(hs.sessionCrypto);
+        clients.add(client);
+        sessionsById.set(client.sessionId, client);
+        httpClients.set(client.sessionId, client);
+
+        const initPayload = Buffer.from(JSON.stringify({
+          peerId: client.id,
+          sid: client.sessionId,
+          rooms: getRoomList()
+        }), 'utf8');
+        const encInit = encryptEnvelope(client.crypto, INNER_JSON, initPayload);
+        const body = buildHttpServerHello(hs.serverNonce, hs.serverPubRaw, encInit);
+        res.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': body.length
+        });
+        res.end(body);
+      })
+      .catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(err.statusCode || 400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+        }
+      });
     return;
   }
 
-  // ---- HTTPS Long-Polling Fallback Endpoints ----
-  if (req.method === 'POST' && parsed.pathname === '/poll/connect') {
-    const client = createHttpClient();
-    clients.add(client);
-    httpClients.set(client.id, client);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: true,
-      peerId: client.id,
-      token: client.token,
-      rooms: getRoomList()
-    }));
-    return;
-  }
-
-  if (req.method === 'GET' && parsed.pathname === '/poll') {
-    const client = authenticateHttpClient(req, parsed);
+  // Encrypted long-poll downstream feed
+  if (req.method === 'GET' && parsed.pathname === '/v1/feed') {
+    const client = authenticateHttpClient(parsed);
     if (!client) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid session' }));
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
       return;
     }
     client.attachPoll(res);
     return;
   }
 
-  if (req.method === 'POST' && parsed.pathname === '/poll/send') {
-    const client = authenticateHttpClient(req, parsed);
+  // Encrypted upstream message push
+  if (req.method === 'POST' && parsed.pathname === '/v1/push') {
+    const client = authenticateHttpClient(parsed);
     if (!client) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid session' }));
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
       return;
     }
-    const contentType = String(req.headers['content-type'] || '').toLowerCase();
     readRequestBody(req, MAX_FRAME_BYTES)
       .then((buf) => {
-        if (contentType.includes('application/octet-stream')) {
-          handleBinaryMessage(client, buf);
-        } else {
-          handleTextMessage(client, buf.toString('utf8'));
+        const ok = handleDecryptedEnvelope(client, buf);
+        if (!ok) {
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+          return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"ok":true}');
+        res.writeHead(204);
+        res.end();
       })
       .catch((err) => {
         if (!res.headersSent) {
-          res.writeHead(err.statusCode || 400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message || 'Bad request' }));
+          res.writeHead(err.statusCode || 400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
         }
       });
     return;
   }
 
-  // Instant tab-close disconnect beacon endpoint (called via navigator.sendBeacon)
-  if (req.method === 'POST' && parsed.pathname === '/leave') {
+  // Encrypted tab-close disconnect beacon (called via navigator.sendBeacon for both WS & HTTP)
+  if (req.method === 'POST' && parsed.pathname === '/v1/close') {
+    const sid = parsed.searchParams.get('s');
+    const client = sid ? sessionsById.get(String(sid)) : null;
     readRequestBody(req, 4096)
       .then((buf) => {
-        try {
-          const { peerId, token } = JSON.parse(buf.toString('utf8') || '{}');
-          if (peerId) {
-            for (const c of clients) {
-              if (c.id === peerId) {
-                if (c.transport === 'http' && token && c.token !== token) break;
-                disconnectClient(c);
-                break;
+        if (client && !client.closed && client.cryptoReady) {
+          const envelope = decryptEnvelope(client.crypto, buf);
+          if (envelope && envelope.innerType === INNER_JSON) {
+            try {
+              const msg = JSON.parse(envelope.payload.toString('utf8'));
+              if (msg && msg.type === 'close') {
+                disconnectClient(client);
               }
-            }
+            } catch (e) {}
           }
-        } catch (e) {}
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"ok":true}');
+        }
+        res.writeHead(204);
+        res.end();
       })
       .catch(() => {
         if (!res.headersSent) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end('{"ok":true}');
+          res.writeHead(204);
+          res.end();
         }
       });
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not Found');
 });
 
 // Render-recommended Node.js timeouts to prevent intermittent 502s behind Render's proxy
@@ -796,7 +1022,6 @@ server.keepAliveTimeout = 120000;
 server.headersTimeout = 125000;
 
 server.on('upgrade', (req, socket, head) => {
-  // Attach an early error guard so socket resets during handshake never crash the process
   let client = null;
   const cleanup = () => {
     if (client) {
@@ -811,6 +1036,13 @@ server.on('upgrade', (req, socket, head) => {
 
   if (!isOriginAllowed(req.headers.origin)) {
     socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (parsed.pathname !== '/' && parsed.pathname !== '/ws' && parsed.pathname !== '/v1/stream') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -834,18 +1066,51 @@ server.on('upgrade', (req, socket, head) => {
   );
 
   client = createWsClient(socket);
-  clients.add(client);
-
-  // Flush the 101 HTTP upgrade headers before sending the first WS frame (better compatibility with strict proxies)
-  setImmediate(() => {
-    if (client && !client.closed) {
-      client.sendJSON({ type: 'welcome', peerId: client.id, rooms: getRoomList() });
+  client.handshakeTimer = setTimeout(() => {
+    if (client && !client.cryptoReady) {
+      disconnectClient(client);
     }
-  });
+  }, HANDSHAKE_TIMEOUT_MS);
 
   let buffer = Buffer.alloc(0);
   let fragOpcode = 0;
   let fragChunks = [];
+
+  function handleWsBinaryFrame(payload) {
+    if (!client.cryptoReady) {
+      const hs = processClientHandshake(payload);
+      if (!hs) {
+        disconnectClient(client);
+        return;
+      }
+      if (client.handshakeTimer) {
+        clearTimeout(client.handshakeTimer);
+        client.handshakeTimer = null;
+      }
+      client.crypto = hs.sessionCrypto;
+      client.cryptoReady = true;
+      clients.add(client);
+      sessionsById.set(client.sessionId, client);
+
+      try {
+        const serverHello = buildWsServerHello(hs.serverNonce, hs.serverPubRaw);
+        socket.write(encodeFrame(0x2, serverHello));
+        client.sendJSON({
+          type: 'welcome',
+          peerId: client.id,
+          sid: client.sessionId,
+          rooms: getRoomList()
+        });
+      } catch (e) {
+        disconnectClient(client);
+      }
+      return;
+    }
+
+    if (!handleDecryptedEnvelope(client, payload)) {
+      disconnectClient(client);
+    }
+  }
 
   function processBuffer() {
     while (buffer.length >= 2) {
@@ -867,7 +1132,8 @@ server.on('upgrade', (req, socket, head) => {
         offset = 10;
       }
 
-      if (len > MAX_FRAME_BYTES) {
+      const maxAllowed = client.cryptoReady ? MAX_FRAME_BYTES : MAX_HANDSHAKE_BYTES;
+      if (len > maxAllowed) {
         disconnectClient(client);
         return;
       }
@@ -904,18 +1170,24 @@ server.on('upgrade', (req, socket, head) => {
             const op = fragOpcode;
             fragOpcode = 0;
             fragChunks = [];
-            if (op === 0x1) handleTextMessage(client, full.toString('utf8'));
-            else if (op === 0x2) handleBinaryMessage(client, full);
+            if (op === 0x2) handleWsBinaryFrame(full);
+            else {
+              disconnectClient(client);
+              return;
+            }
           }
         }
-      } else if (opcode === 0x1 || opcode === 0x2) {
+      } else if (opcode === 0x2) {
         if (fin) {
-          if (opcode === 0x1) handleTextMessage(client, payload.toString('utf8'));
-          else handleBinaryMessage(client, payload);
+          handleWsBinaryFrame(payload);
         } else {
           fragOpcode = opcode;
           fragChunks = [payload];
         }
+      } else if (opcode === 0x1) {
+        // Reject unencrypted text frames
+        disconnectClient(client);
+        return;
       }
     }
   }
@@ -941,6 +1213,7 @@ setInterval(() => {
       }
       continue;
     }
+    if (!c.cryptoReady) continue;
     if (c.missedPings >= MAX_MISSED_PINGS) {
       disconnectClient(c);
       continue;
@@ -951,5 +1224,5 @@ setInterval(() => {
 }, HEARTBEAT_MS);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Whatsnap wss:// + HTTP fallback server listening on port ${PORT}`);
+  console.log(`Encrypted relay server listening on port ${PORT}`);
 });

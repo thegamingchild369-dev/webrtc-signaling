@@ -694,6 +694,7 @@ const server = http.createServer((req, res) => {
       ok: true,
       service: 'whatsnap-server',
       transports: ['wss', 'http-poll'],
+      serverTime: Date.now(),
       rooms: rooms.size,
       clients: clients.size
     }));

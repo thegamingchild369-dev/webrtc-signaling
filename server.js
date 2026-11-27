@@ -1,20 +1,50 @@
-// Headless zero-dependency WebSocket (wss://) connection server for Whatsnap on Render.
-// Serves no frontend HTML — handles WebSocket connections (/ws or /), rooms with cover images,
-// live video/audio/file binary relay, and instant tab-close disconnect.
+// Headless zero-dependency WebSocket (wss://) + HTTPS long-polling fallback server for Whatsnap on Render.
+// Serves no frontend HTML — handles WebSocket connections (/ws or /), HTTPS long-polling fallback (/poll/*),
+// rooms with cover images, live video/audio/file binary relay, and instant tab-close disconnect.
 const http = require('http');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin5923';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
+const HEARTBEAT_MS = 25000;               // 25s heartbeat interval (tolerant of higher-latency proxies)
+const MAX_MISSED_PINGS = 2;               // ~50s grace before closing idle WS sockets
+const HTTP_POLL_HOLD_MS = 20000;          // 20s long-poll hold (well under Render/proxy HTTP timeouts)
+const HTTP_BATCH_DELAY_MS = 20;           // Coalesce burst frames into one HTTP poll response
+const HTTP_IDLE_TIMEOUT_MS = 45000;       // 45s idle timeout for HTTP polling clients
+const HTTP_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 // All connected clients & active rooms
 const clients = new Set();
+// HTTP polling client lookup: Map<peerId, Client>
+const httpClients = new Map();
 // rooms: Map<roomName, { cover: string | null, members: Set<Client> }>
 const rooms = new Map();
+
+function isOriginAllowed(origin) {
+  if (ALLOWED_ORIGINS.includes('*')) return true;
+  if (!origin) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+function applyCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Client-Id, X-Client-Token');
+  res.setHeader('Cache-Control', 'no-store');
+}
 
 // ================= RFC 6455 WEBSOCKET HELPERS =================
 function encodeFrame(opcode, payloadBuf) {
@@ -39,18 +69,40 @@ function encodeFrame(opcode, payloadBuf) {
   return Buffer.concat([header, payload]);
 }
 
-function createClient(socket) {
+function encodeHttpBatch(items) {
+  let total = 0;
+  for (const item of items) {
+    total += 5 + item.payload.length;
+  }
+  const out = Buffer.allocUnsafe(total);
+  let offset = 0;
+  for (const item of items) {
+    out[offset] = item.frameType; // 1 = JSON UTF-8, 2 = Binary
+    out.writeUInt32BE(item.payload.length, offset + 1);
+    item.payload.copy(out, offset + 5);
+    offset += 5 + item.payload.length;
+  }
+  return out;
+}
+
+function createWsClient(socket) {
   return {
     id: crypto.randomBytes(4).toString('hex'),
+    transport: 'ws',
     name: 'User',
     room: null,
     isAdmin: false,
     showAdminTag: false,
     hidden: false,
     trolls: new Set(),
-    alive: true,
+    missedPings: 0,
+    lastSeen: Date.now(),
     closed: false,
     socket,
+    markAlive() {
+      this.missedPings = 0;
+      this.lastSeen = Date.now();
+    },
     sendJSON(obj) {
       if (this.closed || this.socket.destroyed) return;
       try {
@@ -67,18 +119,162 @@ function createClient(socket) {
     ping() {
       if (this.closed || this.socket.destroyed) return;
       try {
+        // Send both RFC 6455 control ping and an app-level JSON ping so proxies that strip control frames still keep alive
         this.socket.write(encodeFrame(0x9, Buffer.alloc(0)));
+        this.sendJSON({ type: 'ping', ts: Date.now() });
       } catch (e) {}
     },
     close() {
       if (this.closed) return;
       this.closed = true;
       try {
-        this.socket.write(encodeFrame(0x8, Buffer.alloc(0)));
-        this.socket.end();
+        if (!this.socket.destroyed) {
+          this.socket.write(encodeFrame(0x8, Buffer.alloc(0)));
+          this.socket.end();
+        }
       } catch (e) {}
     }
   };
+}
+
+function createHttpClient() {
+  const client = {
+    id: crypto.randomBytes(4).toString('hex'),
+    token: crypto.randomBytes(12).toString('hex'),
+    transport: 'http',
+    name: 'User',
+    room: null,
+    isAdmin: false,
+    showAdminTag: false,
+    hidden: false,
+    trolls: new Set(),
+    lastSeen: Date.now(),
+    closed: false,
+    queue: [],
+    queuedBytes: 0,
+    pollRes: null,
+    pollTimer: null,
+    batchTimer: null,
+    markAlive() {
+      this.lastSeen = Date.now();
+    },
+    flushPoll() {
+      if (this.batchTimer) {
+        clearTimeout(this.batchTimer);
+        this.batchTimer = null;
+      }
+      if (!this.pollRes) return;
+      const res = this.pollRes;
+      this.pollRes = null;
+      if (this.pollTimer) {
+        clearTimeout(this.pollTimer);
+        this.pollTimer = null;
+      }
+      const items = this.queue.splice(0, this.queue.length);
+      this.queuedBytes = 0;
+      const body = items.length ? encodeHttpBatch(items) : Buffer.alloc(0);
+      try {
+        if (!res.writableEnded) {
+          res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': body.length
+          });
+          res.end(body);
+        }
+      } catch (e) {}
+    },
+    enqueue(frameType, payloadBuf, dropIfBackedUp = false) {
+      if (this.closed) return;
+      if (dropIfBackedUp && (this.queue.length > 18 || this.queuedBytes > 384 * 1024)) {
+        return;
+      }
+      // Prevent unbounded memory growth if a polling client stalls
+      while (this.queue.length > 0 && this.queuedBytes + payloadBuf.length > HTTP_MAX_QUEUE_BYTES) {
+        const droppedIdx = this.queue.findIndex((item) => item.droppable);
+        if (droppedIdx >= 0) {
+          const [removed] = this.queue.splice(droppedIdx, 1);
+          this.queuedBytes -= removed.payload.length;
+        } else {
+          break;
+        }
+      }
+      this.queue.push({ frameType, payload: payloadBuf, droppable: dropIfBackedUp });
+      this.queuedBytes += payloadBuf.length;
+
+      if (this.pollRes) {
+        if (frameType === 1 || !dropIfBackedUp) {
+          // Control/JSON/file packets flush immediately
+          this.flushPoll();
+        } else if (!this.batchTimer) {
+          this.batchTimer = setTimeout(() => this.flushPoll(), HTTP_BATCH_DELAY_MS);
+        }
+      }
+    },
+    attachPoll(res) {
+      this.markAlive();
+      if (this.pollRes) {
+        const oldRes = this.pollRes;
+        this.pollRes = null;
+        if (this.pollTimer) {
+          clearTimeout(this.pollTimer);
+          this.pollTimer = null;
+        }
+        if (this.batchTimer) {
+          clearTimeout(this.batchTimer);
+          this.batchTimer = null;
+        }
+        try {
+          if (!oldRes.writableEnded) {
+            oldRes.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': 0 });
+            oldRes.end();
+          }
+        } catch (e) {}
+      }
+
+      this.pollRes = res;
+      res.on('close', () => {
+        if (this.pollRes === res) {
+          this.pollRes = null;
+          if (this.pollTimer) {
+            clearTimeout(this.pollTimer);
+            this.pollTimer = null;
+          }
+          if (this.batchTimer) {
+            clearTimeout(this.batchTimer);
+            this.batchTimer = null;
+          }
+        }
+      });
+
+      if (this.queue.length > 0) {
+        this.flushPoll();
+        return;
+      }
+
+      this.pollTimer = setTimeout(() => {
+        if (this.pollRes === res) {
+          this.flushPoll();
+        }
+      }, HTTP_POLL_HOLD_MS);
+    },
+    sendJSON(obj) {
+      if (this.closed) return;
+      this.enqueue(1, Buffer.from(JSON.stringify(obj), 'utf8'), false);
+    },
+    sendBinary(buf, dropIfBackedUp = false) {
+      if (this.closed) return;
+      this.enqueue(2, Buffer.isBuffer(buf) ? buf : Buffer.from(buf), dropIfBackedUp);
+    },
+    ping() {},
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.queue.length = 0;
+      this.queuedBytes = 0;
+      this.flushPoll();
+    }
+  };
+  return client;
 }
 
 // ================= ROOM MANAGEMENT =================
@@ -162,9 +358,16 @@ function disconnectClient(client) {
   client.closed = true;
   leaveRoom(client);
   clients.delete(client);
-  try {
-    if (!client.socket.destroyed) client.socket.destroy();
-  } catch (e) {}
+  if (client.transport === 'http') {
+    httpClients.delete(client.id);
+    client.queue.length = 0;
+    client.queuedBytes = 0;
+    client.flushPoll();
+  } else if (client.socket) {
+    try {
+      if (!client.socket.destroyed) client.socket.destroy();
+    } catch (e) {}
+  }
 }
 
 function joinRoom(client, rawRoom, rawName, rawCover) {
@@ -216,10 +419,19 @@ function joinRoom(client, rawRoom, rawName, rawCover) {
 }
 
 function handleTextMessage(client, text) {
+  client.markAlive();
   let msg;
   try {
     msg = JSON.parse(text);
   } catch (e) {
+    return;
+  }
+
+  if (msg.type === 'ping') {
+    client.sendJSON({ type: 'pong', ts: msg.ts || Date.now() });
+    return;
+  }
+  if (msg.type === 'pong') {
     return;
   }
 
@@ -395,6 +607,7 @@ function handleTextMessage(client, text) {
 // Incoming: [kind(1: 1=video, 2=audio, 3=file), ...payload]
 // Outgoing: [kind(1), peerIdLen(1), ...peerIdBytes, ...payload]
 function handleBinaryMessage(client, data) {
+  client.markAlive();
   if (!client.room || data.length < 2) return;
   const roomObj = rooms.get(client.room);
   if (!roomObj || roomObj.members.size <= 1) return;
@@ -419,11 +632,47 @@ function handleBinaryMessage(client, data) {
   }
 }
 
-// ================= HEADLESS HTTP + WEBSOCKET SERVER =================
+function readRequestBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    req.on('data', (chunk) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        settled = true;
+        reject(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, total));
+    });
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
+function authenticateHttpClient(req, parsed) {
+  const id = parsed.searchParams.get('id') || req.headers['x-client-id'];
+  const token = parsed.searchParams.get('token') || req.headers['x-client-token'];
+  if (!id || !token) return null;
+  const client = httpClients.get(String(id));
+  if (!client || client.closed || client.token !== String(token)) return null;
+  return client;
+}
+
+// ================= HEADLESS HTTP + WEBSOCKET + LONG-POLL SERVER =================
 const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  applyCorsHeaders(req, res);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -431,42 +680,110 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (!isOriginAllowed(req.headers.origin)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Origin not allowed' }));
+    return;
+  }
+
   const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health' || parsed.pathname === '/api/health')) {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, service: 'whatsnap-server', transport: 'wss', rooms: rooms.size, clients: clients.size }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'whatsnap-server',
+      transports: ['wss', 'http-poll'],
+      rooms: rooms.size,
+      clients: clients.size
+    }));
     return;
   }
 
   if (req.method === 'GET' && (parsed.pathname === '/rooms' || parsed.pathname === '/api/rooms')) {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(getRoomList()));
+    return;
+  }
+
+  // ---- HTTPS Long-Polling Fallback Endpoints ----
+  if (req.method === 'POST' && parsed.pathname === '/poll/connect') {
+    const client = createHttpClient();
+    clients.add(client);
+    httpClients.set(client.id, client);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      peerId: client.id,
+      token: client.token,
+      rooms: getRoomList()
+    }));
+    return;
+  }
+
+  if (req.method === 'GET' && parsed.pathname === '/poll') {
+    const client = authenticateHttpClient(req, parsed);
+    if (!client) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid session' }));
+      return;
+    }
+    client.attachPoll(res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/poll/send') {
+    const client = authenticateHttpClient(req, parsed);
+    if (!client) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid session' }));
+      return;
+    }
+    const contentType = String(req.headers['content-type'] || '').toLowerCase();
+    readRequestBody(req, MAX_FRAME_BYTES)
+      .then((buf) => {
+        if (contentType.includes('application/octet-stream')) {
+          handleBinaryMessage(client, buf);
+        } else {
+          handleTextMessage(client, buf.toString('utf8'));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      })
+      .catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(err.statusCode || 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message || 'Bad request' }));
+        }
+      });
     return;
   }
 
   // Instant tab-close disconnect beacon endpoint (called via navigator.sendBeacon)
   if (req.method === 'POST' && parsed.pathname === '/leave') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 4096) req.destroy();
-    });
-    req.on('end', () => {
-      try {
-        const { peerId } = JSON.parse(body || '{}');
-        if (peerId) {
-          for (const c of clients) {
-            if (c.id === peerId) {
-              disconnectClient(c);
-              break;
+    readRequestBody(req, 4096)
+      .then((buf) => {
+        try {
+          const { peerId, token } = JSON.parse(buf.toString('utf8') || '{}');
+          if (peerId) {
+            for (const c of clients) {
+              if (c.id === peerId) {
+                if (c.transport === 'http' && token && c.token !== token) break;
+                disconnectClient(c);
+                break;
+              }
             }
           }
+        } catch (e) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      })
+      .catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"ok":true}');
         }
-      } catch (e) {}
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{"ok":true}');
-    });
+      });
     return;
   }
 
@@ -474,32 +791,57 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// Render-recommended Node.js timeouts to prevent intermittent 502s behind Render's proxy
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+
 server.on('upgrade', (req, socket, head) => {
-  if (ALLOWED_ORIGIN !== '*' && req.headers.origin && req.headers.origin !== ALLOWED_ORIGIN) {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+  // Attach an early error guard so socket resets during handshake never crash the process
+  let client = null;
+  const cleanup = () => {
+    if (client) {
+      disconnectClient(client);
+    } else if (!socket.destroyed) {
+      try { socket.destroy(); } catch (e) {}
+    }
+  };
+  socket.on('error', cleanup);
+  socket.on('close', cleanup);
+  socket.on('end', cleanup);
+
+  if (!isOriginAllowed(req.headers.origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
 
+  const upgradeHeader = String(req.headers.upgrade || '').toLowerCase();
   const key = req.headers['sec-websocket-key'];
-  if (!key) {
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+  if (!key || upgradeHeader !== 'websocket') {
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
 
-  const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+  const accept = crypto.createHash('sha1').update(key.trim() + WS_GUID).digest('base64');
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15000);
   socket.write(
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
     'Connection: Upgrade\r\n' +
     `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
   );
-  socket.setNoDelay(true);
 
-  const client = createClient(socket);
+  client = createWsClient(socket);
   clients.add(client);
-  client.sendJSON({ type: 'welcome', peerId: client.id, rooms: getRoomList() });
+
+  // Flush the 101 HTTP upgrade headers before sending the first WS frame (better compatibility with strict proxies)
+  setImmediate(() => {
+    if (client && !client.closed) {
+      client.sendJSON({ type: 'welcome', peerId: client.id, rooms: getRoomList() });
+    }
+  });
 
   let buffer = Buffer.alloc(0);
   let fragOpcode = 0;
@@ -545,7 +887,7 @@ server.on('upgrade', (req, socket, head) => {
       }
 
       buffer = buffer.subarray(offset + maskLen + len);
-      client.alive = true;
+      client.markAlive();
 
       if (opcode === 0x8) {
         disconnectClient(client);
@@ -553,7 +895,7 @@ server.on('upgrade', (req, socket, head) => {
       } else if (opcode === 0x9) {
         try { socket.write(encodeFrame(0xA, payload)); } catch (e) {}
       } else if (opcode === 0xA) {
-        // Pong
+        // Pong already marked client alive
       } else if (opcode === 0x0) {
         if (fragOpcode) {
           fragChunks.push(payload);
@@ -587,25 +929,27 @@ server.on('upgrade', (req, socket, head) => {
     buffer = head;
     processBuffer();
   }
-
-  const cleanup = () => disconnectClient(client);
-  socket.on('close', cleanup);
-  socket.on('end', cleanup);
-  socket.on('error', cleanup);
 });
 
-// Keep WebSockets alive behind Render's proxy & clean up dead sockets quickly
+// Keep WebSockets alive behind proxies & clean up dead WS / HTTP polling clients
 setInterval(() => {
-  for (const c of clients) {
-    if (!c.alive) {
+  const now = Date.now();
+  for (const c of Array.from(clients)) {
+    if (c.transport === 'http') {
+      if (!c.pollRes && (now - c.lastSeen) > HTTP_IDLE_TIMEOUT_MS) {
+        disconnectClient(c);
+      }
+      continue;
+    }
+    if (c.missedPings >= MAX_MISSED_PINGS) {
       disconnectClient(c);
       continue;
     }
-    c.alive = false;
+    c.missedPings++;
     c.ping();
   }
-}, 12000);
+}, HEARTBEAT_MS);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Whatsnap wss:// connection server listening on port ${PORT}`);
+  console.log(`Whatsnap wss:// + HTTP fallback server listening on port ${PORT}`);
 });

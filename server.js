@@ -534,7 +534,7 @@ function broadcastRoomTrolls(roomName) {
   if (!roomObj) return;
   const map = {};
   for (const m of roomObj.members) {
-    if (!m.hidden) {
+    if (!m.hidden || m.isAdmin) {
       map[m.id] = Array.from(m.trolls);
     }
   }
@@ -754,6 +754,7 @@ function handleTextMessage(client, text) {
       'deepfry-video',
       'freeze-video',
       'fnaf-twitch',
+      'datamosh-video',
       'corrupt-audio',
       'cutout-audio',
       'echo-audio'
@@ -767,8 +768,11 @@ function handleTextMessage(client, text) {
     if (!roomObj) return;
 
     for (const member of roomObj.members) {
-      if (member === client) continue;
-      if (targetId !== 'all' && member.id !== targetId) continue;
+      if (targetId === 'all') {
+        if (member === client && action !== 'reset') continue;
+      } else if (member.id !== targetId) {
+        continue;
+      }
 
       if (action === 'popup') {
         member.sendJSON({ type: 'troll', action: 'popup', value });

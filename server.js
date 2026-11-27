@@ -14,13 +14,13 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MB limit (covers 8 MB files + Base64 overhead)
 const MAX_HANDSHAKE_BYTES = 1024;
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
-const HANDSHAKE_TIMEOUT_MS = 10000;       // 10s limit to complete WS ECDH handshake
+const HANDSHAKE_TIMEOUT_MS = 20000;       // 20s limit to complete WS ECDH handshake
 const HEARTBEAT_MS = 25000;               // 25s heartbeat interval (tolerant of higher-latency proxies)
 const MAX_MISSED_PINGS = 2;               // ~50s grace before closing idle WS sockets
-const HTTP_POLL_HOLD_MS = 12000;          // 12s default long-poll hold (safe under strict proxy 15s timeouts)
+const HTTP_POLL_HOLD_MS = 10000;          // 10s default long-poll hold (safe under strict proxy timeouts)
 const HTTP_POLL_MAX_HOLD_MS = 15000;
 const HTTP_BATCH_DELAY_MS = 20;           // Coalesce burst frames into one HTTP poll response
-const HTTP_IDLE_TIMEOUT_MS = 45000;       // 45s idle timeout for HTTP polling clients
+const HTTP_IDLE_TIMEOUT_MS = 65000;       // 65s idle timeout for HTTP polling clients
 const HTTP_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 // Encrypted inner envelope types (never visible in plaintext on the wire)
@@ -931,6 +931,14 @@ function authenticateHttpClient(parsed) {
   return client;
 }
 
+function safeParseUrl(req) {
+  try {
+    return new URL(req.url || '/', 'http://localhost');
+  } catch (e) {
+    return null;
+  }
+}
+
 // ================= HEADLESS ENCRYPTED HTTP + WEBSOCKET SERVER =================
 const server = http.createServer((req, res) => {
   applyCorsHeaders(req, res);
@@ -947,7 +955,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const parsed = safeParseUrl(req);
+  if (!parsed) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request');
+    return;
+  }
 
   // Neutral status endpoint (also handles Render's / and /health checks without leaking app details)
   if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health' || parsed.pathname === '/api/health' || parsed.pathname === '/v1/status')) {
@@ -1108,8 +1121,8 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (parsed.pathname !== '/' && parsed.pathname !== '/ws' && parsed.pathname !== '/v1/stream') {
+  const parsed = safeParseUrl(req);
+  if (!parsed || (parsed.pathname !== '/' && parsed.pathname !== '/ws' && parsed.pathname !== '/v1/stream')) {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
@@ -1117,13 +1130,14 @@ server.on('upgrade', (req, socket, head) => {
 
   const upgradeHeader = String(req.headers.upgrade || '').toLowerCase();
   const key = req.headers['sec-websocket-key'];
-  if (!key || upgradeHeader !== 'websocket') {
+  if (!key || !upgradeHeader.includes('websocket')) {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
 
   const accept = crypto.createHash('sha1').update(key.trim() + WS_GUID).digest('base64');
+  socket.setTimeout(0);
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 15000);
   socket.write(
@@ -1290,6 +1304,13 @@ setInterval(() => {
     c.ping();
   }
 }, HEARTBEAT_MS);
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && err.message ? err.message : err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err && err.message ? err.message : err);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Encrypted relay server listening on port ${PORT}`);

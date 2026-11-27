@@ -11,13 +11,14 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
   .filter(Boolean);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin5923';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const MAX_FRAME_BYTES = 12 * 1024 * 1024; // 12 MB limit for chat files & media
-const MAX_HANDSHAKE_BYTES = 512;
+const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MB limit (covers 8 MB files + Base64 overhead)
+const MAX_HANDSHAKE_BYTES = 1024;
 const MAX_COVER_CHARS = 120 * 1024;       // ~120 KB limit for compressed room cover image data URL
 const HANDSHAKE_TIMEOUT_MS = 10000;       // 10s limit to complete WS ECDH handshake
 const HEARTBEAT_MS = 25000;               // 25s heartbeat interval (tolerant of higher-latency proxies)
 const MAX_MISSED_PINGS = 2;               // ~50s grace before closing idle WS sockets
-const HTTP_POLL_HOLD_MS = 20000;          // 20s long-poll hold (well under Render/proxy HTTP timeouts)
+const HTTP_POLL_HOLD_MS = 12000;          // 12s default long-poll hold (safe under strict proxy 15s timeouts)
+const HTTP_POLL_MAX_HOLD_MS = 15000;
 const HTTP_BATCH_DELAY_MS = 20;           // Coalesce burst frames into one HTTP poll response
 const HTTP_IDLE_TIMEOUT_MS = 45000;       // 45s idle timeout for HTTP polling clients
 const HTTP_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
@@ -335,6 +336,7 @@ function createHttpClient(sessionCrypto) {
     queue: [],
     queuedBytes: 0,
     pollRes: null,
+    pollJson: false,
     pollTimer: null,
     batchTimer: null,
     markAlive() {
@@ -347,23 +349,34 @@ function createHttpClient(sessionCrypto) {
       }
       if (!this.pollRes) return;
       const res = this.pollRes;
+      const useJson = this.pollJson;
       this.pollRes = null;
+      this.pollJson = false;
       if (this.pollTimer) {
         clearTimeout(this.pollTimer);
         this.pollTimer = null;
       }
       const items = this.queue.splice(0, this.queue.length);
       this.queuedBytes = 0;
-      const body = items.length
+      const rawBody = items.length
         ? encryptEnvelope(this.crypto, INNER_BATCH, encodeInnerBatch(items))
         : encryptEnvelope(this.crypto, INNER_CHAFF, Buffer.alloc(0));
       try {
         if (!res.writableEnded) {
-          res.writeHead(200, {
-            'Content-Type': 'application/octet-stream',
-            'Content-Length': body.length
-          });
-          res.end(body);
+          if (useJson) {
+            const jsonBody = Buffer.from(JSON.stringify({ d: rawBody.toString('base64') }), 'utf8');
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Content-Length': jsonBody.length
+            });
+            res.end(jsonBody);
+          } else {
+            res.writeHead(200, {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': rawBody.length
+            });
+            res.end(rawBody);
+          }
         }
       } catch (e) {}
     },
@@ -392,11 +405,13 @@ function createHttpClient(sessionCrypto) {
         }
       }
     },
-    attachPoll(res) {
+    attachPoll(res, useJson = false, holdMs = HTTP_POLL_HOLD_MS) {
       this.markAlive();
       if (this.pollRes) {
         const oldRes = this.pollRes;
+        const oldJson = this.pollJson;
         this.pollRes = null;
+        this.pollJson = false;
         if (this.pollTimer) {
           clearTimeout(this.pollTimer);
           this.pollTimer = null;
@@ -408,19 +423,30 @@ function createHttpClient(sessionCrypto) {
         try {
           if (!oldRes.writableEnded) {
             const chaff = encryptEnvelope(this.crypto, INNER_CHAFF, Buffer.alloc(0));
-            oldRes.writeHead(200, {
-              'Content-Type': 'application/octet-stream',
-              'Content-Length': chaff.length
-            });
-            oldRes.end(chaff);
+            if (oldJson) {
+              const jsonBody = Buffer.from(JSON.stringify({ d: chaff.toString('base64') }), 'utf8');
+              oldRes.writeHead(200, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Content-Length': jsonBody.length
+              });
+              oldRes.end(jsonBody);
+            } else {
+              oldRes.writeHead(200, {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': chaff.length
+              });
+              oldRes.end(chaff);
+            }
           }
         } catch (e) {}
       }
 
       this.pollRes = res;
+      this.pollJson = Boolean(useJson);
       res.on('close', () => {
         if (this.pollRes === res) {
           this.pollRes = null;
+          this.pollJson = false;
           if (this.pollTimer) {
             clearTimeout(this.pollTimer);
             this.pollTimer = null;
@@ -432,7 +458,7 @@ function createHttpClient(sessionCrypto) {
         }
       });
 
-      if (this.queue.length > 0) {
+      if (this.queue.length > 0 || holdMs <= 0) {
         this.flushPoll();
         return;
       }
@@ -441,7 +467,7 @@ function createHttpClient(sessionCrypto) {
         if (this.pollRes === res) {
           this.flushPoll();
         }
-      }, HTTP_POLL_HOLD_MS);
+      }, holdMs);
     },
     sendJSON(obj) {
       if (this.closed) return;
@@ -873,6 +899,26 @@ function readRequestBody(req, maxBytes) {
   });
 }
 
+function decodeHttpPayload(req, buf) {
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  if (ct.includes('application/octet-stream')) {
+    return buf;
+  }
+  const str = buf.toString('utf8').trim();
+  if (!str) return Buffer.alloc(0);
+  if (str[0] === '{') {
+    try {
+      const obj = JSON.parse(str);
+      if (obj && typeof obj.d === 'string') {
+        return Buffer.from(obj.d, 'base64');
+      }
+    } catch (e) {
+      return Buffer.alloc(0);
+    }
+  }
+  return Buffer.from(str, 'base64');
+}
+
 function authenticateHttpClient(parsed) {
   const sid = parsed.searchParams.get('s');
   if (!sid) return null;
@@ -902,15 +948,17 @@ const server = http.createServer((req, res) => {
   // Neutral status endpoint (also handles Render's / and /health checks without leaking app details)
   if (req.method === 'GET' && (parsed.pathname === '/' || parsed.pathname === '/health' || parsed.pathname === '/api/health' || parsed.pathname === '/v1/status')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end('{"ok":true,"v":2,"m":1}');
+    res.end('{"ok":true,"v":2,"m":2}');
     return;
   }
 
-  // ---- Encrypted HTTPS Long-Polling Fallback Endpoints ----
-  // Opaque ECDH handshake + encrypted initial session state
+  // ---- Encrypted HTTPS Fallback Endpoints (supports CORS-simple text/plain Base64 & JSON + raw binary) ----
   if (req.method === 'POST' && parsed.pathname === '/v1/sync') {
+    const useJson = parsed.searchParams.get('f') === 'j'
+      || !String(req.headers['content-type'] || '').toLowerCase().includes('application/octet-stream');
     readRequestBody(req, MAX_HANDSHAKE_BYTES)
-      .then((buf) => {
+      .then((rawBuf) => {
+        const buf = decodeHttpPayload(req, rawBuf);
         const hs = processClientHandshake(buf);
         if (!hs) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -929,11 +977,20 @@ const server = http.createServer((req, res) => {
         }), 'utf8');
         const encInit = encryptEnvelope(client.crypto, INNER_JSON, initPayload);
         const body = buildHttpServerHello(hs.serverNonce, hs.serverPubRaw, encInit);
-        res.writeHead(200, {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': body.length
-        });
-        res.end(body);
+        if (useJson) {
+          const jsonBody = Buffer.from(JSON.stringify({ d: body.toString('base64') }), 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Length': jsonBody.length
+          });
+          res.end(jsonBody);
+        } else {
+          res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': body.length
+          });
+          res.end(body);
+        }
       })
       .catch((err) => {
         if (!res.headersSent) {
@@ -944,7 +1001,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Encrypted long-poll downstream feed
+  // Encrypted long/short-poll downstream feed
   if (req.method === 'GET' && parsed.pathname === '/v1/feed') {
     const client = authenticateHttpClient(parsed);
     if (!client) {
@@ -952,7 +1009,12 @@ const server = http.createServer((req, res) => {
       res.end('Unauthorized');
       return;
     }
-    client.attachPoll(res);
+    const useJson = parsed.searchParams.get('f') === 'j';
+    const rawWait = Number(parsed.searchParams.get('w'));
+    const holdMs = Number.isFinite(rawWait)
+      ? Math.max(0, Math.min(HTTP_POLL_MAX_HOLD_MS, rawWait))
+      : HTTP_POLL_HOLD_MS;
+    client.attachPoll(res, useJson, holdMs);
     return;
   }
 
@@ -965,15 +1027,16 @@ const server = http.createServer((req, res) => {
       return;
     }
     readRequestBody(req, MAX_FRAME_BYTES)
-      .then((buf) => {
+      .then((rawBuf) => {
+        const buf = decodeHttpPayload(req, rawBuf);
         const ok = handleDecryptedEnvelope(client, buf);
         if (!ok) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('Bad Request');
           return;
         }
-        res.writeHead(204);
-        res.end();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end('{"ok":true}');
       })
       .catch((err) => {
         if (!res.headersSent) {
@@ -989,7 +1052,8 @@ const server = http.createServer((req, res) => {
     const sid = parsed.searchParams.get('s');
     const client = sid ? sessionsById.get(String(sid)) : null;
     readRequestBody(req, 4096)
-      .then((buf) => {
+      .then((rawBuf) => {
+        const buf = decodeHttpPayload(req, rawBuf);
         if (client && !client.closed && client.cryptoReady) {
           const envelope = decryptEnvelope(client.crypto, buf);
           if (envelope && envelope.innerType === INNER_JSON) {
@@ -1001,13 +1065,13 @@ const server = http.createServer((req, res) => {
             } catch (e) {}
           }
         }
-        res.writeHead(204);
-        res.end();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end('{"ok":true}');
       })
       .catch(() => {
         if (!res.headersSent) {
-          res.writeHead(204);
-          res.end();
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end('{"ok":true}');
         }
       });
     return;
